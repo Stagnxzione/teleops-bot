@@ -1,6 +1,6 @@
 ﻿.env
 *.log
-__pycache__/
+pycache/
 *.pyc
 bot_state.json
 ptb_persistence.pkl
