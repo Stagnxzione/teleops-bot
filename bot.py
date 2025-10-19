@@ -8,6 +8,13 @@ from pathlib import Path
 from html import escape as html_escape  # безопасный HTML
 import asyncio
 
+# ===== TZ: безопасная работа с часовыми поясами =====
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # старые окружения
+    ZoneInfo = None  # будем использовать фолбэк
+# ====================================================
+
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -46,6 +53,48 @@ load_dotenv(dotenv_path=dotenv_path)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
+# ===== TZ: получаем локальную таймзону с фолбэком =====
+LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
+
+def _resolve_local_tz(name: str):
+    """
+    Пытаемся создать ZoneInfo(name). Если базы нет (Windows без tzdata) —
+    пробуем импортировать tzdata. Если снова не вышло — даём фиксированный
+    оффсет для известных зон (МСК = UTC+3). В крайнем случае — UTC.
+    Возвращаем кортеж: (tzinfo, source_str)
+    """
+    # 1) Прямая попытка ZoneInfo
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name), f"ZoneInfo({name})"
+        except Exception:
+            pass
+
+    # 2) Попробовать подтянуть базу tzdata (если установлена)
+    try:
+        import tzdata  # noqa: F401
+        if ZoneInfo is not None:
+            try:
+                return ZoneInfo(name), f"ZoneInfo({name}) via tzdata"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3) Фиксированные оффсеты для популярных зон
+    fixed_map = {
+        "Europe/Moscow": timezone(timedelta(hours=3)),   # МСК, без переходов
+        "UTC": timezone.utc,
+    }
+    if name in fixed_map:
+        return fixed_map[name], f"fixed-offset({name})"
+
+    # 4) Совсем крайний случай
+    return timezone.utc, "fallback=UTC"
+
+LOCAL_TZ, LOCAL_TZ_SRC = _resolve_local_tz(LOCAL_TZ_NAME)
+# ========================================================
+
 def _parse_admin_ids(env_value: str) -> set[int]:
     ids = set()
     for part in (env_value or "").split(","):
@@ -70,6 +119,7 @@ print(">>> ENV CHECK:",
       f"THREADS_CHAT_ID={THREADS_CHAT_ID}",
       f"ENTRY_THREAD_ID={ENTRY_THREAD_ID}",
       f"REPORT_THREAD_ID={REPORT_THREAD_ID}",
+      f"LOCAL_TZ={LOCAL_TZ_NAME} ({LOCAL_TZ_SRC})",
       sep=" | ", flush=True)
 
 if not BOT_TOKEN:
@@ -101,7 +151,7 @@ DRV_RE = re.compile(r"^[A-Za-z]{3}-?\d{3,10}$")
 NUM_RE = re.compile(r"^\d{1,6}$")  # только цифры 1..6
 
 # --------- ТЕКСТ для входной темы ----------
-ENTRY_PROMPT = "Чтобы связаться с телеоператором, перейдите в чат с ботом."
+ENTRY_PROMPT = "Чтобы связаться с телеоператором, перейди в чат с ботом."
 
 # ==========================================================
 # ПАМЯТЬ + простой JSON-персист (на случай рестартов)
@@ -274,23 +324,37 @@ def vehicle_bort(vehicle_type: str, vehicle_number: str) -> str:
         return f"St-{number}"
     return f"{vehicle_type} {number}"
 
-def _fmt_hhmm_from_iso(iso_str: Optional[str]) -> str:
+# ===== TZ: UTC ISO -> локальная строка
+def _parse_iso(iso_str: Optional[str]) -> Optional[datetime]:
+    """Безопасно парсим ISO8601 и приводим к UTC-aware."""
     if not iso_str:
-        return "--:--"
-    try:
-        dt = datetime.fromisoformat(iso_str)  # aware/naive — принимаем оба
-        return dt.strftime("%H:%M")
-    except Exception:
-        return "--:--"
-
-def _fmt_date_from_iso(iso_str: Optional[str]) -> str:
-    if not iso_str:
-        return "--.--.----"
+        return None
     try:
         dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%d.%m.%Y")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        return "--.--.----"
+        return None
+
+def _to_local(dt_utc: Optional[datetime]) -> Optional[datetime]:
+    """UTC → локальная зона (из LOCAL_TZ)."""
+    if dt_utc is None:
+        return None
+    try:
+        return dt_utc.astimezone(LOCAL_TZ)
+    except Exception:
+        return None
+
+def _fmt_hhmm_from_iso(iso_str: Optional[str]) -> str:
+    dt_utc = _parse_iso(iso_str)
+    dt_local = _to_local(dt_utc)
+    return dt_local.strftime("%H:%M") if dt_local else "--:--"
+
+def _fmt_date_from_iso(iso_str: Optional[str]) -> str:
+    dt_utc = _parse_iso(iso_str)
+    dt_local = _to_local(dt_utc)
+    return dt_local.strftime("%d.%m.%Y") if dt_local else "--.--.----"
 
 def _driver_display_name(driver: Dict) -> str:
     first = (driver.get("first_name") or "").strip()
@@ -565,7 +629,7 @@ async def stage_task_code(message, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault("request", {"task_code":"","vehicle_type":"","vehicle_number":"","tasks":[]})
     context.user_data["await"] = "task_code"
     await message.reply_text(
-        "Привет! Пожалуйста, укажи название задачи в Jira (например, Drv-12345)",
+        "Привет! Укажи название задачи в Jira (например, Drv-12345)",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Не указывать", callback_data="skip_task_code")]])
     )
 
@@ -902,7 +966,7 @@ async def _send_report_to_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict):
     except Exception as e:
         logging.exception("send report to topic failed", exc_info=e)
 
-async def on_operator_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_operator_close(update: Update, Context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data or ""
     logging.info("CALLBACK DATA (op_close): %r", data)
