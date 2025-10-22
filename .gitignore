@@ -2,6 +2,7 @@
 *.log
 pycache/
 *.pyc
+roles.json
 bot_state.json
 ptb_persistence.pkl
 venv/
