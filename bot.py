@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 from pathlib import Path
 from html import escape as html_escape
 import asyncio
-from tempfile import NamedTemporaryFile  # <-- для атомарной записи roles.json
+from tempfile import NamedTemporaryFile  # для атомарной записи roles.json
 
 # ===== TZ: безопасная работа с часовыми поясами =====
 try:
@@ -22,7 +22,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-    # parse_mode по умолчанию ставим в Defaults
 from telegram.constants import ParseMode
 from telegram.helpers import mention_html
 from telegram.ext import (
@@ -137,7 +136,8 @@ ENTRY_PROMPT = "Чтобы связаться с телеоператором, �
 # ПАМЯТЬ + JSON-персист
 # ==========================================================
 STATE_PATH = Path(__file__).with_name("bot_state.json")
-ROLES_PATH = Path(__file__).with_name("roles.json")  # <-- отдельное хранилище ролей
+ROLES_PATH = Path(__file__).with_name("roles.json")  # отдельное хранилище ролей
+logging.info("STATE_PATH=%s | ROLES_PATH=%s", STATE_PATH.resolve(), ROLES_PATH.resolve())
 
 AUTH_DRIVERS: Dict[int, Dict] = {}
 DRIVERS: Dict[int, Dict] = {}
@@ -221,40 +221,25 @@ def _load_state() -> None:
     except Exception as e:
         logging.warning("Failed to load state: %s", e)
 
-# ---- дебаунс сохранения состояния ----
-class _StateDebouncer:
-    def __init__(self, path: Path, interval_ms: int = 250):
-        self.path = path
-        self.interval = interval_ms / 1000.0
-        self._dirty = False
-        self._task: Optional[asyncio.Task] = None
-    def mark_dirty(self):
-        self._dirty = True
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._worker())
-    async def _worker(self):
-        try:
-            await asyncio.sleep(self.interval)
-            if not self._dirty:
-                return
-            self._dirty = False
-            data = {
-                "DRIVERS": DRIVERS,
-                "NEXT_REQUEST_ID": NEXT_REQUEST_ID,
-                "REQUESTS": REQUESTS,
-                "PENDING_ADMIN_COMMENT": PENDING_ADMIN_COMMENT,
-            }
-            STATE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logging.warning("Debounced state save failed: %s", e)
-
-_STATE_DEBOUNCER = _StateDebouncer(STATE_PATH)
-
+# --- СИНХРОННОЕ и АТОМАРНОЕ сохранение состояния ---
 def _save_state() -> None:
-    _STATE_DEBOUNCER.mark_dirty()
+    try:
+        data = {
+            "DRIVERS": DRIVERS,
+            "NEXT_REQUEST_ID": NEXT_REQUEST_ID,
+            "REQUESTS": REQUESTS,
+            "PENDING_ADMIN_COMMENT": PENDING_ADMIN_COMMENT,
+        }
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp_path = STATE_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, STATE_PATH)  # атомарная замена
+        logging.debug("State saved to %s (%d bytes)", STATE_PATH, len(payload))
+    except Exception as e:
+        logging.warning("Failed to save state: %s", e)
 
 _load_state()
-ROLES_STORE.load()  # <-- загрузили (или мигрировали) роли отдельно
+ROLES_STORE.load()  # загрузили (или мигрировали) роли отдельно
 
 # ==========================================================
 # ВСПОМОГАТЕЛЬНЫЕ
@@ -680,7 +665,7 @@ async def _ensure_role_or_ask(update_or_msg, context: ContextTypes.DEFAULT_TYPE)
     role = get_user_role(u.id)
     if role:
         return role
-    # админа не спрашиваем — роль идёт из ADMIN_IDS
+    # админа не спрашиваем — роль идёт из ADMIN_USER_IDS
     if is_admin(u.id):
         return "admin"
     # Просим выбрать роль
@@ -761,6 +746,13 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"user_data: {dict(context.user_data)}")
 
+# Админская команда: форс-сохранение состояния (проверка пути/прав)
+async def cmd_savestate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    _save_state()
+    await update.effective_message.reply_text(f"State saved to: <code>{STATE_PATH.resolve()}</code>")
+
 # Диагностика: лёгкий лог
 async def on_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -771,31 +763,60 @@ async def on_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.debug("UPDATE INBOUND: %s", d)
 
 # ==========================================================
-# РОЛИ — обработчик кнопки
+# РОЛИ — обработчик кнопки (с «перезапуском» логики после выбора)
 # ==========================================================
 async def on_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if is_admin(query.from_user.id):
-        set_user_role(query.from_user.id, "admin")
-        await query.message.reply_text("Роль: администратор.")
+
+    user_id = query.from_user.id
+
+    # Админа не спрашиваем — роль уже "admin" по ADMIN_USER_IDS
+    if is_admin(user_id):
+        set_user_role(user_id, "admin")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("Роль: администратор. Доступен весь функционал (создание, приём и закрытие заявок).")
         return
+
     data = query.data or ""
     _, _, role = data.partition(":")
     if role not in ("driver", "operator"):
-        await query.answer("Некорректная роль.", show_alert=True); return
-    set_user_role(query.from_user.id, role)
-    await query.message.reply_text(f"Роль установлена: <b>{'водитель' if role=='driver' else 'телеоператор'}</b>.")
+        await query.answer("Некорректная роль.", show_alert=True)
+        return
+
+    set_user_role(user_id, role)
+
+    # убираем клавиатуру выбора роли
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # сбрасываем локальный мастер
+    context.user_data.pop("request", None)
+    context.user_data["await"] = None
+
+    # "перезапуск" /start в зависимости от роли
+    if role == "operator":
+        await query.message.reply_text("Роль установлена: <b>телеоператор</b>.\nОжидайте вызовы и принимайте заявки из уведомлений.")
+    else:
+        await query.message.reply_text("Роль установлена: <b>водитель</b>.\nНачнём оформление заявки.")
+        await stage_task_code(query.message, context)
 
 # ==========================================================
-# ДИАЛОГ ВОДИТЕЛЯ
+# ДИАЛОГ ВОДИТЕЛЯ (ввод Jira и номера борта)
 # ==========================================================
 async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Обрабатываем только ЛС
     if update.effective_chat and update.effective_chat.type != "private":
         return
 
     role = get_user_role(update.effective_user.id)
     if not role:
+        # спросим роль и выйдем — следующий апдейт продолжит
         await _ensure_role_or_ask(update.effective_message, context)
         return
 
@@ -803,13 +824,14 @@ async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "operator":
         return
 
-    # если админ/оператор пишет комментарий — этот обработчик не мешает
+    # если оператор/админ пишет комментарий к закрытию — не мешаем
     if is_staff(update.effective_user.id) and PENDING_ADMIN_COMMENT.get(update.effective_user.id):
         return
 
     msg_text = (update.effective_message.text or "").strip() if update.effective_message else ""
     logging.info("on_user_text <- %r | await=%r", msg_text, context.user_data.get("await"))
 
+    # если мастер не активен — стартуем с Jira
     if "await" not in context.user_data or context.user_data.get("await") is None:
         await stage_task_code(update.effective_message, context)
         return
@@ -840,6 +862,9 @@ async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stage_tasks(update.effective_message, context)
         return
 
+# ==========================================================
+# СКИП КОДА ЗАДАЧИ
+# ==========================================================
 async def on_skip_task_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1275,6 +1300,7 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("state", cmd_state))
+    app.add_handler(CommandHandler("savestate", cmd_savestate))  # только для админа
 
     # Диагностика
     app.add_handler(TypeHandler(Update, on_any_update), group=-100)
