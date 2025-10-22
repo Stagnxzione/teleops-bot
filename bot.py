@@ -1,15 +1,17 @@
+__version__ = "1.0.0"
 import os
 import re
 import json
 import logging
+import subprocess  # <-- для git CLI
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from pathlib import Path
 from html import escape as html_escape
 import asyncio
-from tempfile import NamedTemporaryFile  # для атомарной записи roles.json
+from tempfile import NamedTemporaryFile  # для записи roles.json
 
-# ===== TZ: безопасная работа с часовыми поясами =====
+# ===== Безопасная работа с часовыми поясами =====
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -21,6 +23,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    __version__ as PTB_VER,  # <<< будем проверять версию библиотеки
 )
 from telegram.constants import ParseMode
 from telegram.helpers import mention_html
@@ -35,6 +38,21 @@ from telegram.ext import (
     PicklePersistence,
     Defaults,
 )
+
+# ---------------------------------------------------------
+# ПРОВЕРКА ВЕРСИЙ (не запускаться на старой PTB)
+# ---------------------------------------------------------
+def _ensure_versions():
+    try:
+        major = int(str(PTB_VER).split(".")[0])
+    except Exception:
+        major = 0
+    if major < 20:
+        raise RuntimeError(
+            f"python-telegram-bot >=20.x required, found {PTB_VER}. "
+            "Обновите зависимости по requirements/lock."
+        )
+_ensure_versions()
 
 # ---------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -55,7 +73,7 @@ load_dotenv(dotenv_path=dotenv_path)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ===== TZ: получаем локальную таймзону с фолбэком =====
+# ===== получаем локальную таймзону с фолбэком =====
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Europe/Moscow")
 
 def _resolve_local_tz(name: str):
@@ -65,7 +83,7 @@ def _resolve_local_tz(name: str):
         except Exception:
             pass
     try:
-        import tzdata  # noqa: F401
+        import tzdata
         if ZoneInfo is not None:
             try:
                 return ZoneInfo(name), f"ZoneInfo({name}) via tzdata"
@@ -118,6 +136,106 @@ if not ENTRY_THREAD_ID:
 if not REPORT_THREAD_ID:
     raise RuntimeError("Не задан REPORT_THREAD_ID — это id темы для публикации отчётов")
 
+# ==========================================================
+# ==== VERSIONING (ENV -> version.json -> git -> __version__)
+# ==========================================================
+_VERSION_JSON_PATH = Path(__file__).with_name("version.json")
+
+def _read_version_json(path: Path) -> Optional[Dict[str, str]]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            # ожидаемые ключи: describe, branch, sha, build_at
+            return {
+                "describe": str(data.get("describe") or ""),
+                "branch": str(data.get("branch") or ""),
+                "sha": str(data.get("sha") or ""),
+                "build_at": str(data.get("build_at") or ""),
+            }
+    except Exception as e:
+        logging.debug("version.json read failed: %s", e)
+    return None
+
+def _git_cmd(args: List[str]) -> Optional[str]:
+    try:
+        out = subprocess.check_output(["git"] + args, stderr=subprocess.DEVNULL)
+        return out.decode("utf-8", "ignore").strip()
+    except Exception:
+        return None
+
+def _git_info() -> Optional[Dict[str, str]]:
+    desc = _git_cmd(["describe", "--tags", "--dirty", "--always"])
+    if not desc:
+        return None
+    branch = _git_cmd(["rev-parse", "--abbrev-ref", "HEAD"]) or ""
+    sha = _git_cmd(["rev-parse", "--short", "HEAD"]) or ""
+    # когда из git — build_at ставим текущее UTC время
+    build_at = datetime.utcnow().replace(tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"describe": desc, "branch": branch, "sha": sha, "build_at": build_at}
+
+def _env_info() -> Optional[Dict[str, str]]:
+    d = os.getenv("GIT_DESCRIBE")
+    b = os.getenv("GIT_BRANCH")
+    s = os.getenv("GIT_SHA")
+    t = os.getenv("BUILD_AT")
+    if any([d, b, s, t]):
+        return {
+            "describe": d or "",
+            "branch": b or "",
+            "sha": s or "",
+            "build_at": t or "",
+        }
+    return None
+
+def get_build_info() -> Dict[str, str]:
+    # 1) ENV от CI/сервиса
+    info = _env_info()
+    if info:
+        return info
+    # 2) version.json от CI (лежит рядом с bot.py)
+    info = _read_version_json(_VERSION_JSON_PATH)
+    if info:
+        return info
+    # 3) локальный git
+    info = _git_info()
+    if info:
+        return info
+    # 4) совсем fallback
+    return {"describe": __version__, "branch": "", "sha": "", "build_at": ""}
+
+def version_banner() -> str:
+    i = get_build_info()
+    tail = []
+    if i.get("branch"):
+        tail.append(i["branch"])
+    if i.get("sha"):
+        tail.append(f"@{i['sha']}")
+    tail_str = "[" + " ".join(tail) + "]" if tail else ""
+    built = f" built {i['build_at']}" if i.get("build_at") else ""
+    return f"{i['describe']}{(' ' + tail_str) if tail_str else ''}{built} | PTB {PTB_VER}"
+
+def changelog_text(limit: int = 15) -> str:
+    """
+    Пытаемся отдать последние коммиты.
+    Если git недоступен — честно скажем, что недоступно.
+    """
+    # Красиво: дата в локальном времени пользователя сервера не критична — пусть UTC
+    try:
+        out = _git_cmd(["log", f"-{limit}", "--pretty=format:%h %ad %s", "--date=short"])
+        if out:
+            lines = out.splitlines()
+            # экранируем для HTML <code>
+            safe = "\n".join(html_escape(line, quote=False) for line in lines)
+            return safe
+    except Exception:
+        pass
+    return "Changelog недоступен (нет доступа к git истории)."
+
+# ---------------------------------------------------------
+# Печатаем баннер версии в логи при старте процесса
+# ---------------------------------------------------------
+print(">>> build:", version_banner(), flush=True)
+
 VEHICLE_TYPES = ["Kia Ceed", "Sitrak"]
 
 TASK_CHOICES = [
@@ -130,7 +248,7 @@ PRESET_TASKS = ["emergency_brake", "safe_brake", "teleop_path"]
 DRV_RE = re.compile(r"^[A-Za-z]{3}-?\d{3,10}$")
 NUM_RE = re.compile(r"^\d{1,6}$")
 
-ENTRY_PROMPT = "Чтобы связаться с телеоператором, перейди в чат с ботом 👇"
+ENTRY_PROMPT = "Чтобы связаться с телеоператором, пожалуйста, перейди в чат с ботом 👇"
 
 # ==========================================================
 # ПАМЯТЬ + JSON-персист
@@ -304,6 +422,7 @@ def create_request(driver_user_id: int, task_code: str, vehicle_type: str,
         "thread_id": None,
         "thread_message_id": None,       # якорь: описание (закреп)
         "thread_wait_message_id": None,  # «Ожидалка»
+        # (опционально) можно хранить «raw_description», если в будущем появится свободный текст
     }
     _save_state()
     return rid
@@ -517,19 +636,42 @@ def _build_description(req: Dict) -> str:
     return "\n".join(lines)
 
 def report_text(req: Dict) -> str:
+    """
+    Формирует текст отчёта.
+    - Для tasks с "custom": оставляем ссылку "Нестандартная задача (описание в топике)".
+    - Для обычных tasks: описание выводим как скопируемый многострочный текст.
+    """
     created_iso = req.get("created_at")
     date_line = _fmt_date_from_iso(created_iso)
     time_line = _fmt_hhmm_from_iso(created_iso)
     vts = vehicle_bort(req.get("vehicle_type",""), req.get("vehicle_number",""))
+
     mins = _resolution_minutes(req.get("accepted_at"), req.get("closed_at"))
     solve = "-" if mins is None else ("<1 мин" if mins < 1 else f"~{mins} мин")
+
+    status_line = ""
+    st = (req.get("status") or "").strip()
+    if st == "done":
+        status_line = "\n<b>✅ Задача выполнена</b>"
+    elif st == "not_done":
+        status_line = "\n<b>❌ Задача не выполнена</b>"
+
     descr_block = _build_description(req)
+    is_custom = "custom" in (req.get("tasks") or [])
+
+    if is_custom:
+        descr_line = f"<b>Описание:</b> {descr_block}"
+    else:
+        # без ссылок, как копируемый текст
+        descr_line = f"<b>Описание:</b>\n<code>{_esc(descr_block)}</code>"
+
     return (
-        f"Отчет от <code>{_esc(date_line)}</code>\n"
-        f"Время: <code>{_esc(time_line)}</code>\n"
-        f"ВАТС: <code>{_esc(vts)}</code>\n"
-        f"Описание: {descr_block}\n"
-        f"Время решения: <code>{_esc(solve)}</code>"
+        f"<b>Отчет от</b> <code>{_esc(date_line)}</code>\n"
+        f"<b>Время:</b> <code>{_esc(time_line)}</code>\n"
+        f"<b>ВАТС:</b> <code>{_esc(vts)}</code>"
+        f"{status_line}\n"
+        f"{descr_line}\n"
+        f"<b>Время решения:</b> <code>{_esc(solve)}</code>"
     )
 
 # ==== Клавиатуры ====
@@ -580,7 +722,7 @@ def operator_controls_keyboard(request_id: int, current_status: str, deep_link: 
         [InlineKeyboardButton("🗄 Закрыть заявку",      callback_data=f"op_close:{request_id}")],
     ]
     if deep_link:
-        rows.append([InlineKeyboardButton("🔗 Открыть диалог в теме", url=deep_link)])
+        rows.append([InlineKeyboardButton("💬 Перейти к чату с водителем", url=deep_link)])
     rows.append([InlineKeyboardButton(f"ℹ️ Текущий статус: {status_line}", callback_data="noop")])
     return InlineKeyboardMarkup(rows)
 
@@ -588,7 +730,7 @@ def operator_claim_keyboard(request_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🧑‍💻 Подключиться", callback_data=f"op_claim:{request_id}")]])
 
 def _driver_open_url_keyboard(url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("👨‍💼 Перейти к диалогу с оператором", url=url)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💬 Перейти к чату с оператором", url=url)]])
 
 # ==========================================================
 # ТОПИКИ (FORUM TOPICS)
@@ -619,6 +761,8 @@ async def post_intro_in_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict, tex
             chat_id=THREADS_CHAT_ID,
             message_thread_id=req["thread_id"],
             text=text,
+            parse_mode=ParseMode.HTML,          # важно: копируем «как есть»
+            disable_web_page_preview=True,
         )
         req["thread_message_id"] = m.message_id  # якорь — описание
         req["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -637,6 +781,8 @@ async def post_waiting_in_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict) -
             chat_id=THREADS_CHAT_ID,
             message_thread_id=req["thread_id"],
             text="⏳ Ожидайте подключения оператора",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
         req["thread_wait_message_id"] = m.message_id
         req["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -681,7 +827,7 @@ async def stage_task_code(message, context: ContextTypes.DEFAULT_TYPE):
     if not role:
         return
     if role == "operator":
-        await message.reply_text("У тебя роль телеоператора — создание заявок недоступно.")
+        await message.reply_text("У тебя роль телеоператора — создание заявок недоступно!")
         return
     context.user_data.setdefault("request", {"task_code":"","vehicle_type":"","vehicle_number":"","tasks":[]})
     context.user_data["await"] = "task_code"
@@ -718,7 +864,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not role:
         return
     if role == "operator":
-        await update.effective_message.reply_text("Роль: телеоператор. Ожидайте вызовы и принимайте заявки из уведомлений.")
+        await update.effective_message.reply_text("Привет, телеоператор! \nНа данный момент твоя помощь не требуется 😞")
         return
     await stage_task_code(update.effective_message, context)
 
@@ -726,9 +872,18 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_user_role(update.effective_user.id) or "—"
     await update.effective_message.reply_text(f"Твой Telegram ID: <code>{update.effective_user.id}</code>\nРоль: <b>{role}</b>")
 
+# ==== VERSIONING COMMANDS ====
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = html_escape(version_banner(), quote=False)
+    await update.effective_message.reply_text(f"<code>{text}</code>")
+
+async def cmd_changelog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = changelog_text(limit=15)
+    await update.effective_message.reply_text(f"<code>{text}</code>")
+
 async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("У тебя роль администратора и её нельзя сменить.")
+        await update.effective_message.reply_text("У тебя роль администратора и её нельзя сменить!")
         return
     await update.effective_message.reply_text("Выбери роль:", reply_markup=ROLE_PICK_KB)
 
@@ -763,7 +918,7 @@ async def on_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.debug("UPDATE INBOUND: %s", d)
 
 # ==========================================================
-# РОЛИ — обработчик кнопки (с «перезапуском» логики после выбора)
+# РОЛИ — обработчик кнопки (не запускаем мастер автоматически)
 # ==========================================================
 async def on_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -771,67 +926,61 @@ async def on_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
 
-    # Админа не спрашиваем — роль уже "admin" по ADMIN_USER_IDS
     if is_admin(user_id):
         set_user_role(user_id, "admin")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await query.message.reply_text("Роль: администратор. Доступен весь функционал (создание, приём и закрытие заявок).")
+        await query.message.reply_text("Роль: администратор. Доступен весь функционал (создание, приём и закрытие заявок)")
         return
 
     data = query.data or ""
     _, _, role = data.partition(":")
     if role not in ("driver", "operator"):
-        await query.answer("Некорректная роль.", show_alert=True)
+        await query.answer("Некорректная роль", show_alert=True)
         return
 
     set_user_role(user_id, role)
 
-    # убираем клавиатуру выбора роли
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    # сбрасываем локальный мастер
     context.user_data.pop("request", None)
     context.user_data["await"] = None
 
-    # "перезапуск" /start в зависимости от роли
     if role == "operator":
-        await query.message.reply_text("Роль установлена: <b>телеоператор</b>.\nОжидайте вызовы и принимайте заявки из уведомлений.")
+        await query.message.reply_text(
+            "✅ Роль установлена: <b>телеоператора</b>\nБот пришлет уведомление, если будет нужна твоя помощь!"
+        )
     else:
-        await query.message.reply_text("Роль установлена: <b>водитель</b>.\nНачнём оформление заявки.")
-        await stage_task_code(query.message, context)
+        await query.message.reply_text(
+            "✅ Роль установлена: <b>водитель</b>\nЕсли хочешь создать заявку прямо сейчас, то введи команду /start"
+        )
 
 # ==========================================================
-# ДИАЛОГ ВОДИТЕЛЯ (ввод Jira и номера борта)
+# ДИАЛОГ ВОДИТЕЛЯ
 # ==========================================================
 async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обрабатываем только ЛС
     if update.effective_chat and update.effective_chat.type != "private":
         return
 
     role = get_user_role(update.effective_user.id)
     if not role:
-        # спросим роль и выйдем — следующий апдейт продолжит
         await _ensure_role_or_ask(update.effective_message, context)
         return
 
-    # оператор не может создавать заявки
     if role == "operator":
         return
 
-    # если оператор/админ пишет комментарий к закрытию — не мешаем
     if is_staff(update.effective_user.id) and PENDING_ADMIN_COMMENT.get(update.effective_user.id):
         return
 
     msg_text = (update.effective_message.text or "").strip() if update.effective_message else ""
     logging.info("on_user_text <- %r | await=%r", msg_text, context.user_data.get("await"))
 
-    # если мастер не активен — стартуем с Jira
     if "await" not in context.user_data or context.user_data.get("await") is None:
         await stage_task_code(update.effective_message, context)
         return
@@ -843,7 +992,7 @@ async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = msg.strip()
         if msg and not DRV_RE.match(msg):
             await update.effective_message.reply_text(
-                "Формат задачи в Jira: три латинские буквы и 3–10 цифр. \n❗️Попробуйте ещё раз❗️",
+                "Формат задачи в Jira: три латинские буквы и 3–10 цифр \n❗️Попробуй ещё раз❗️",
                 reply_markup=SKIP_TASK_CODE_KB
             )
             return
@@ -854,7 +1003,7 @@ async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "vehicle_number":
         if not msg or not NUM_RE.match(msg):
             await update.effective_message.reply_text(
-                "Номер борта должен содержать только цифры (например, 030). Попробуйте ещё раз!",
+                "Номер борта должен содержать только цифры (например, 030) \n❗️Попробуй ещё раз❗️",
                 reply_markup=back_keyboard("vehicle_type")
             )
             return
@@ -878,7 +1027,7 @@ async def on_skip_task_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _submit_request_and_notify(query, context: ContextTypes.DEFAULT_TYPE):
     req_local = context.user_data.get("request", {})
     if not (req_local.get("vehicle_type") and req_local.get("vehicle_number")):
-        await query.answer("Не все поля заполнены.", show_alert=True); return
+        await query.answer("Не все поля заполнены!", show_alert=True); return
 
     request_id = create_request(
         driver_user_id=query.from_user.id,
@@ -894,7 +1043,7 @@ async def _submit_request_and_notify(query, context: ContextTypes.DEFAULT_TYPE):
     # Создаём тему
     thread_id = await ensure_forum_topic(context, req)
 
-    # 1) Публикуем описание заявки и закрепляем
+    # 1) Публикуем описание заявки (summary) и закрепляем
     thread_msg_id = None
     if thread_id:
         summary_mid = await post_intro_in_topic(context, req, summary)
@@ -942,10 +1091,12 @@ async def _submit_request_and_notify(query, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=query.from_user.id,
             text=summary,
-            reply_markup=_driver_open_url_keyboard(deep_link)
+            reply_markup=_driver_open_url_keyboard(deep_link),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
     else:
-        await context.bot.send_message(chat_id=query.from_user.id, text=summary)
+        await context.bot.send_message(chat_id=query.from_user.id, text=summary, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     # сброс локального состояния
     context.user_data.pop("request", None)
@@ -965,11 +1116,11 @@ async def on_operator_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Некорректный ID заявки.", show_alert=True); return
 
     if not is_staff(query.from_user.id):
-        await query.answer("Недостаточно прав.", show_alert=True); return
+        await query.answer("Недостаточно прав!", show_alert=True); return
 
     req = load_request(req_id)
     if not req:
-        await query.answer("Заявка не найдена.", show_alert=True); return
+        await query.answer("Заявка не найдена!", show_alert=True); return
 
     if req.get("operator_user_id"):
         op_id = req["operator_user_id"]
@@ -1002,7 +1153,8 @@ async def on_operator_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=THREADS_CHAT_ID,
                 message_thread_id=req["thread_id"],
-                text=f"✅ Оператор принял заявку: {op_mention}",
+                text=f"✅ Оператор {op_mention} принял заявку",
+                parse_mode=ParseMode.HTML,
             )
             req["updated_at"] = datetime.now(timezone.utc).isoformat()
             _save_state()
@@ -1015,10 +1167,10 @@ async def on_operator_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_admin = operator_controls_keyboard(req_id, req["status"], deep_link=deep_link)
 
     try:
-        await query.message.edit_text(summary, reply_markup=kb_admin)
+        await query.message.edit_text(summary, reply_markup=kb_admin, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception:
         try:
-            await context.bot.send_message(chat_id=query.from_user.id, text=summary, reply_markup=kb_admin)
+            await context.bot.send_message(chat_id=query.from_user.id, text=summary, reply_markup=kb_admin, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as e:
             logging.exception("send operator panel failed", exc_info=e)
 
@@ -1111,6 +1263,8 @@ async def _send_report_to_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict):
             chat_id=THREADS_CHAT_ID,
             message_thread_id=REPORT_THREAD_ID,
             text=txt,
+            parse_mode=ParseMode.HTML,          # формат отчёта
+            disable_web_page_preview=True,
         )
     except Exception as e:
         logging.exception("send report to topic failed", exc_info=e)
@@ -1137,26 +1291,26 @@ async def on_operator_close(update: Update, Context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➡️ Продолжить без комментариев", callback_data=f"op_comment_no:{req_id}")],
     ])
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text("Закрыть заявку. Добавить комментарий?", reply_markup=kb)
+    await query.message.reply_text("Закрываю заявку. Добавить комментарий?", reply_markup=kb)
 
 async def on_operator_comment_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data or ""
     logging.info("CALLBACK DATA (op_comment_*): %r", data)
     if not is_staff(query.from_user.id):
-        await query.answer("Недостаточно прав.", show_alert=True); return
+        await query.answer("Недостаточно прав!", show_alert=True); return
 
     if data.startswith("op_comment_yes:"):
-        await query.message.reply_text("Напиши комментарий одним сообщением.")
+        await query.message.reply_text("Напиши комментарий одним сообщением")
         return
 
     if data.startswith("op_comment_no:"):
         req_id = PENDING_ADMIN_COMMENT.get(query.from_user.id)
         if not req_id:
-            await query.answer("Не найдена заявка для закрытия.", show_alert=True); return
+            await query.answer("Не найдена заявка для закрытия!", show_alert=True); return
 
+        # НЕ меняем статус — оставляем done/not_done/new как есть
         set_request_comment(req_id, query.from_user.id, "")
-        set_request_status(req_id, "closed", query.from_user.id)
         mark_closed(req_id, query.from_user.id)
 
         req = load_request(req_id)
@@ -1166,7 +1320,7 @@ async def on_operator_comment_choice(update: Update, context: ContextTypes.DEFAU
 
         PENDING_ADMIN_COMMENT.pop(query.from_user.id, None)
         _save_state()
-        await query.message.reply_text("Заявка закрыта. Отчёт опубликован в теме.")
+        await query.message.reply_text("Заявка закрыта, отчёт сформирован 👌")
 
 async def on_staff_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Текст оператора/админа — это комментарий к закрытию, если он ожидается."""
@@ -1182,7 +1336,7 @@ async def on_staff_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     comment = (update.effective_message.text or "").strip()
     set_request_comment(req_id, user.id, comment)
-    set_request_status(req_id, "closed", user.id)
+    # НЕ меняем статус — оставляем done/not_done/new как есть
     mark_closed(req_id, user.id)
 
     req = load_request(req_id)
@@ -1192,7 +1346,7 @@ async def on_staff_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     PENDING_ADMIN_COMMENT.pop(user.id, None)
     _save_state()
-    await update.effective_message.reply_text("Заявка закрыта. Отчёт опубликован в теме.")
+    await update.effective_message.reply_text("Заявка закрыта, отчёт сформирован 👌")
 
 # ==========================================================
 # ОБРАБОТЧИКИ КНОПОК ТС/ЗАДАЧ
@@ -1200,7 +1354,6 @@ async def on_staff_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_vehicle_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    # только не-операторы (водители или админы) могут продолжать создавать заявки
     if is_operator(query.from_user.id) and not is_admin(query.from_user.id):
         await query.answer("Создание заявок недоступно для телеоператоров.", show_alert=True)
         return
@@ -1217,9 +1370,8 @@ async def on_tasks_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     logging.info("CALLBACK DATA (tasks): %r", data)
 
-    # ограничение для операторов
     if is_operator(query.from_user.id) and not is_admin(query.from_user.id):
-        await query.answer("Создание заявок недоступно для телеоператоров.", show_alert=True)
+        await query.answer("Создание заявок недоступно для телеоператоров!", show_alert=True)
         return
 
     if data == "tasks_preset":
@@ -1231,7 +1383,7 @@ async def on_tasks_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "tasks_manual":
         selected = context.user_data.get("request", {}).get("tasks", [])
         await query.message.reply_text(
-            "Отметь нужные задачи и нажми «Готово».",
+            "Отметь нужные задачи и нажми «Готово»",
             reply_markup=tasks_keyboard(selected)
         )
         return
@@ -1279,6 +1431,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # MAIN
 # ==========================================================
 def main():
+
     async def _post_init(app: Application):
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
@@ -1286,7 +1439,9 @@ def main():
         except Exception as e:
             logging.warning(f"delete_webhook failed: {e}")
         me = await app.bot.get_me()
-        logging.info("Logged in as @%s (id=%s)", me.username, me.id)
+        logging.info("Logged in as @%s (id=%s) | PTB %s", me.username, me.id, PTB_VER)
+        # Баннер на старте
+        logging.info("Build banner: %s", version_banner())
 
     persistence = PicklePersistence(filepath="ptb_persistence.pkl", update_interval=30)
     defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -1301,6 +1456,9 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("state", cmd_state))
     app.add_handler(CommandHandler("savestate", cmd_savestate))  # только для админа
+    # === VERSIONING
+    app.add_handler(CommandHandler("version", cmd_version))
+    app.add_handler(CommandHandler("changelog", cmd_changelog))
 
     # Диагностика
     app.add_handler(TypeHandler(Update, on_any_update), group=-100)

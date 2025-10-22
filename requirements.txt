@@ -1,2 +1,4 @@
-python-telegram-bot>=20.7,<21.0
-python-dotenv>=1.0.1
+python>=3.11,<3.13
+python-telegram-bot>=21.0,<22
+python-dotenv>=1.0,<2
+tzdata>=2024.1; platform_system=="Windows"
