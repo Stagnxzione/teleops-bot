@@ -1,6 +1,7 @@
 ﻿.env
 *.log
 pycache/
+roles.json
 *.pyc
 ptb_persistence.pkl
 venv/
