@@ -7,6 +7,7 @@ from typing import List, Dict, Optional
 from pathlib import Path
 from html import escape as html_escape
 import asyncio
+from tempfile import NamedTemporaryFile  # <-- для атомарной записи roles.json
 
 # ===== TZ: безопасная работа с часовыми поясами =====
 try:
@@ -21,6 +22,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+    # parse_mode по умолчанию ставим в Defaults
 from telegram.constants import ParseMode
 from telegram.helpers import mention_html
 from telegram.ext import (
@@ -135,6 +137,7 @@ ENTRY_PROMPT = "Чтобы связаться с телеоператором, �
 # ПАМЯТЬ + JSON-персист
 # ==========================================================
 STATE_PATH = Path(__file__).with_name("bot_state.json")
+ROLES_PATH = Path(__file__).with_name("roles.json")  # <-- отдельное хранилище ролей
 
 AUTH_DRIVERS: Dict[int, Dict] = {}
 DRIVERS: Dict[int, Dict] = {}
@@ -143,12 +146,69 @@ REQUESTS: Dict[int, Dict] = {}
 PENDING_ADMIN_COMMENT: Dict[int, int] = {}
 REQUEST_LOCKS: Dict[int, asyncio.Lock] = {}
 
-# ==== РОЛИ ====
-# 'admin' — из ADMIN_IDS; 'driver' / 'operator' — выбираются пользователем
-ROLES: Dict[int, str] = {}  # user_id -> "driver" | "operator" | "admin"
+# ==== ОТДЕЛЬНОЕ ХРАНИЛИЩЕ РОЛЕЙ ==============================================
+class RolesStore:
+    """roles.json с атомарной записью, автопереносом из bot_state.json."""
+    def __init__(self, path: Path):
+        self.path = path
+        self._roles: Dict[int, str] = {}
+
+    def load(self):
+        # 1) читаем roles.json если есть
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text("utf-8"))
+                self._roles = {int(k): v for k, v in data.items()}
+                logging.info("Roles loaded from %s (count=%d)", self.path, len(self._roles))
+                return
+            except Exception as e:
+                logging.warning("Failed to load roles.json: %s", e)
+        # 2) миграция из старого bot_state.json (поле ROLES)
+        try:
+            if STATE_PATH.exists():
+                st = json.loads(STATE_PATH.read_text("utf-8"))
+                old = st.get("ROLES") or {}
+                if old:
+                    self._roles = {int(k): v for k, v in old.items()}
+                    self.save()
+                    logging.info("Roles migrated from bot_state.json to roles.json (count=%d)", len(self._roles))
+        except Exception as e:
+            logging.warning("Failed to migrate roles from bot_state.json: %s", e)
+
+    def save(self):
+        # атомарная запись через временный файл
+        payload = json.dumps({str(k): v for k, v in self._roles.items()}, ensure_ascii=False, indent=2)
+        try:
+            with NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(self.path.parent)) as tf:
+                tf.write(payload)
+                tmp = tf.name
+            os.replace(tmp, self.path)
+        except Exception as e:
+            logging.warning("Failed to write roles.json: %s", e)
+
+    def get(self, user_id: int) -> Optional[str]:
+        if user_id in ADMIN_IDS:
+            return "admin"
+        return self._roles.get(user_id)
+
+    def set(self, user_id: int, role: str):
+        # админов не пишем — их роль из ADMIN_IDS
+        if user_id in ADMIN_IDS:
+            self._roles.pop(user_id, None)
+        else:
+            self._roles[user_id] = role
+        self.save()
+
+    def all_operators(self) -> List[int]:
+        ops = [uid for uid, r in self._roles.items() if r == "operator"]
+        # админов добавляем всегда
+        return list(sorted(set(ops + list(ADMIN_IDS))))
+
+ROLES_STORE = RolesStore(ROLES_PATH)
+# ============================================================================
 
 def _load_state() -> None:
-    global DRIVERS, NEXT_REQUEST_ID, REQUESTS, PENDING_ADMIN_COMMENT, ROLES
+    global DRIVERS, NEXT_REQUEST_ID, REQUESTS, PENDING_ADMIN_COMMENT
     if not STATE_PATH.exists():
         return
     try:
@@ -157,8 +217,7 @@ def _load_state() -> None:
         NEXT_REQUEST_ID = int(data.get("NEXT_REQUEST_ID", 1))
         REQUESTS = data.get("REQUESTS", {})
         PENDING_ADMIN_COMMENT = data.get("PENDING_ADMIN_COMMENT", {})
-        ROLES = data.get("ROLES", {})
-        logging.info("State loaded from %s (reqs=%d, drivers=%d, roles=%d)", STATE_PATH, len(REQUESTS), len(DRIVERS), len(ROLES))
+        logging.info("State loaded from %s (reqs=%d, drivers=%d)", STATE_PATH, len(REQUESTS), len(DRIVERS))
     except Exception as e:
         logging.warning("Failed to load state: %s", e)
 
@@ -184,7 +243,6 @@ class _StateDebouncer:
                 "NEXT_REQUEST_ID": NEXT_REQUEST_ID,
                 "REQUESTS": REQUESTS,
                 "PENDING_ADMIN_COMMENT": PENDING_ADMIN_COMMENT,
-                "ROLES": ROLES,
             }
             STATE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
@@ -196,6 +254,7 @@ def _save_state() -> None:
     _STATE_DEBOUNCER.mark_dirty()
 
 _load_state()
+ROLES_STORE.load()  # <-- загрузили (или мигрировали) роли отдельно
 
 # ==========================================================
 # ВСПОМОГАТЕЛЬНЫЕ
@@ -209,37 +268,27 @@ def set_driver_seen(u) -> None:
     }
     _save_state()
 
+# ---- РОЛИ (через RolesStore) ----
 def get_user_role(user_id: int) -> Optional[str]:
-    if user_id in ADMIN_IDS:
-        return "admin"
-    return ROLES.get(user_id)
+    return ROLES_STORE.get(user_id)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def is_operator(user_id: int) -> bool:
-    role = get_user_role(user_id)
-    return role == "operator"
+    return get_user_role(user_id) == "operator"
 
 def is_driver(user_id: int) -> bool:
-    role = get_user_role(user_id)
-    return role == "driver"
+    return get_user_role(user_id) == "driver"
 
 def is_staff(user_id: int) -> bool:
-    # оператор или админ
     return is_admin(user_id) or is_operator(user_id)
 
 def set_user_role(user_id: int, role: str) -> None:
-    if user_id in ADMIN_IDS:
-        ROLES[user_id] = "admin"
-    else:
-        ROLES[user_id] = role
-    _save_state()
+    ROLES_STORE.set(user_id, role)
 
 def all_operator_ids() -> List[int]:
-    # все пользователи с ролью operator + админы (они всегда получают)
-    ops = [uid for uid, r in ROLES.items() if r == "operator"]
-    return list(sorted(set(ops + list(ADMIN_IDS))))
+    return ROLES_STORE.all_operators()
 
 def new_request_id() -> int:
     global NEXT_REQUEST_ID
@@ -494,7 +543,7 @@ def report_text(req: Dict) -> str:
         f"Отчет от <code>{_esc(date_line)}</code>\n"
         f"Время: <code>{_esc(time_line)}</code>\n"
         f"ВАТС: <code>{_esc(vts)}</code>\n"
-        f"Описание: {descr_block}\n"  # descr_block может содержать ссылку
+        f"Описание: {descr_block}\n"
         f"Время решения: <code>{_esc(solve)}</code>"
     )
 
@@ -585,7 +634,6 @@ async def post_intro_in_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict, tex
             chat_id=THREADS_CHAT_ID,
             message_thread_id=req["thread_id"],
             text=text,
-            parse_mode=ParseMode.HTML
         )
         req["thread_message_id"] = m.message_id  # якорь — описание
         req["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -604,7 +652,6 @@ async def post_waiting_in_topic(context: ContextTypes.DEFAULT_TYPE, req: Dict) -
             chat_id=THREADS_CHAT_ID,
             message_thread_id=req["thread_id"],
             text="⏳ Ожидайте подключения оператора",
-            parse_mode=ParseMode.HTML
         )
         req["thread_wait_message_id"] = m.message_id
         req["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -633,10 +680,8 @@ async def _ensure_role_or_ask(update_or_msg, context: ContextTypes.DEFAULT_TYPE)
     role = get_user_role(u.id)
     if role:
         return role
-    # Автонаznачение админа
+    # админа не спрашиваем — роль идёт из ADMIN_IDS
     if is_admin(u.id):
-        ROLES[u.id] = "admin"
-        _save_state()
         return "admin"
     # Просим выбрать роль
     await context.bot.send_message(
@@ -758,7 +803,7 @@ async def on_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "operator":
         return
 
-    # если админ сейчас пишет комментарий — этот обработчик не мешает
+    # если админ/оператор пишет комментарий — этот обработчик не мешает
     if is_staff(update.effective_user.id) and PENDING_ADMIN_COMMENT.get(update.effective_user.id):
         return
 
